@@ -1,0 +1,72 @@
+[
+    {
+        "event": "Vessel Arrived Anchorage 01/08/01/08/",
+        "start_time": "2025 ",
+        "end_time": "06:15 "
+    },
+    {
+        "event": "Pilot Onboard 01/08/01/08/",
+        "start_time": "2025 ",
+        "end_time": "07:00 "
+    },
+    {
+        "event": "Vessel Berthed 01/08/01/08/Berth No. 3",
+        "start_time": "2025 ",
+        "end_time": "08:00 "
+    },
+    {
+        "event": "Cargo Loading Commenced 01/08/Shore Pump Started",
+        "start_time": "2025 ",
+        "end_time": "09:15 "
+    },
+    {
+        "event": "Loading Interrupted (Rain) 01/08/01/08/Rain stopped at",
+        "start_time": "2025 ",
+        "end_time": "12:30 "
+    },
+    {
+        "event": "Cargo Loading Resumed 01/08/",
+        "start_time": "2025 ",
+        "end_time": "14:10"
+    },
+    {
+        "event": "Cargo Loading Completed 01/08/01/08/",
+        "start_time": "2025 ",
+        "end_time": "22:45 "
+    },
+    {
+        "event": "Hose Disconnected 01/08/01/08/",
+        "start_time": "2025 ",
+        "end_time": "23:00 "
+    },
+    {
+        "event": "Pilot Onboard (Departure) 02/08/02/08/",
+        "start_time": "2025 ",
+        "end_time": "00:30 "
+    },
+    {
+        "event": "Vessel Sailed 02/08/02/08/",
+        "start_time": "2025 ",
+        "end_time": "01:15 "
+    },
+    {
+        "event": "Master\u2019s Remarks:",
+        "start_time": "NULL",
+        "end_time": "NULL"
+    },
+    {
+        "event": "All operations carried out smoothly. Weather interruptions minimal.",
+        "start_time": "NULL",
+        "end_time": "NULL"
+    },
+    {
+        "event": "Signed:",
+        "start_time": "NULL",
+        "end_time": "NULL"
+    },
+    {
+        "event": "Master, MV OCEAN STAR",
+        "start_time": "NULL",
+        "end_time": "NULL"
+    }
+]
