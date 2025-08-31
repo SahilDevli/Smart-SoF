@@ -1,33 +1,26 @@
 import os
+import re
+import uuid
+import json
+import shutil
+import pdfplumber
+import pandas as pd
+from pathlib import Path
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
-import shutil
-import pdfplumber
-import re
-import pandas as pd
-import json
-import uuid
 from docx import Document
-import spacy
+from pdf2image import convert_from_path
+import pytesseract
 
-# --- Load NLP Model ---
-nlp = spacy.load("en_core_web_sm")
-
-# Import your configuration
+# --- Load configuration
 from config import settings
 
-# Initialize FastAPI app
-app = FastAPI(title="Document Processor Backend (ML + NLP Integration)")
+app = FastAPI(title="Document(SoF & CP) Processor Backend")
 
-# --- CORS Configuration ---
-origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-]
-
+# --- CORS
+origins = ["http://localhost:3000", "http://localhost:5173"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -36,277 +29,281 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Startup Event (for directory creation) ---
+# --- Startup
 @app.on_event("startup")
 def on_startup():
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     print(f"Upload directory '{settings.UPLOAD_DIR}' ensured.")
 
 
-# --- Document Extraction Helpers ---
-def pdf_extract(path: Path) -> List[str]:
-    lines = []
+# ---------------- File Extractors ---------------- #
+def pdf_extract(path: Path) -> tuple[List[str], str]:
+    """
+    Extract text lines from PDF using pdfplumber, with OCR fallback.
+    Includes normalization and line merging like standalone pdf_to_text.
+    """
+    text = ""
+    method = "plumber"
+
     try:
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    for line in page_text.split('\n'):
-                        line = line.strip()
-                        if line:
-                            lines.append(line)
-    except Exception as e:
-        print(f"Error extracting PDF: {path} - {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to read PDF file: {path.name}. Error: {e}")
-    return lines
+                extracted = page.extract_text() or ""
+                text += extracted + "\n"
+    except Exception:
+        text = ""
+
+    # --- Step 2: OCR fallback if nothing extracted ---
+    if not text.strip():
+        print("[⚠] Falling back to OCR...")
+        method = "ocr"
+        pages = convert_from_path(str(path))
+        for img in pages:
+            text += pytesseract.image_to_string(img) + "\n"
+
+    # --- Step 3: Normalize lines ---
+    raw_lines = [re.sub(r"\s+", " ", line.strip()) for line in text.splitlines() if line.strip()]
+    merged_lines = []
+    buffer = ""
+
+    # Pattern: one or two digits + '.' + space
+    serial_pattern = re.compile(r"^\s*\d{1,2}\.\s+")
+    # Stop merging once tables start
+    stop_keywords = ("DETAILS", "DAILY", "WORKING", "DATE", "HOURS")
+
+    merging_allowed = True
+
+    for line in raw_lines:
+        clean = line.strip()
+        if not clean:
+            continue
+
+        # --- Stop condition ---
+        if any(clean.upper().startswith(word) for word in stop_keywords):
+            if buffer:
+                merged_lines.append(buffer.strip())
+                buffer = ""
+            merging_allowed = False
+
+        if merging_allowed:
+            if serial_pattern.match(clean):
+                # New numbered entry → flush buffer
+                if buffer:
+                    merged_lines.append(buffer.strip())
+                    buffer = ""
+                buffer = clean
+            else:
+                # Continuation line
+                if buffer:
+                    buffer += " " + clean
+                else:
+                    merged_lines.append(clean)
+        else:
+            if buffer:
+                merged_lines.append(buffer.strip())
+                buffer = ""
+            merged_lines.append(clean)
+
+    # Final flush
+    if buffer:
+        merged_lines.append(buffer.strip())
+
+    # --- Step 4: Post-cleaning ---
+    cleaned_output = []
+    for line in merged_lines:
+        line = re.sub(r"\s{2,}", " ", line)  # collapse spaces
+        line = line.replace("’", "'").replace("`", "'")
+        cleaned_output.append(line)
+
+    return cleaned_output, method
 
 
 def extract_docx_lines(path: Path) -> List[str]:
-    lines = []
-    try:
-        document = Document(path)
-        for paragraph in document.paragraphs:
-            line = paragraph.text.strip()
-            if line:
-                lines.append(line)
-    except Exception as e:
-        print(f"Error extracting DOCX: {path} - {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to read DOCX file: {path.name}. Error: {e}")
-    return lines
+    return [p.text.strip() for p in Document(path).paragraphs if p.text.strip()]
 
 
 def extract_txt_lines(path: Path) -> List[str]:
-    lines = []
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f if line.strip()]
-    except Exception as e:
-        print(f"Error reading TXT file: {path} - {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to read TXT file: {path.name}. Error: {e}")
-    return lines
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-# --- ML/NLP Event Parser ---
-time_regx = r"\b\d{1,2}:\d{2}(?:\s*hrs|\s*H)?\b"
+# ---------------- Cleaning (file1.py logic) ---------------- #
+def clean_and_merge(lines: List[str]) -> List[str]:
+    serial_pattern = re.compile(r"^\s*\d+\.\s+")
+    stop_keywords = ("DETAILS", "OF", "DAILY", "WORKING", "Date")
 
-map_keyword = {
-    "Loading": ["load", "commence", "start"],
-    "Discharging": ["discharge", "complete", "finish"],
-    "Shifting": ["shift"],
-    "Anchorage": ["anchorage"]
-}
+    merged_lines = []
+    buffer = ""
+    merging_allowed = True
 
-def ml_parse_events(text_lines: List[str]) -> List[dict]:
-    identified_events = []
-    for line_text in text_lines:
-        doc = nlp(line_text)
-        sentence_text = line_text.strip()
+    for line in lines:
+        clean = line.strip()
+        if not clean:
+            continue
 
-        # Extract times
-        times_found = re.findall(time_regx, sentence_text)
-        normalized_times = [
-            time.replace("hrs", "").replace("H", "").strip() 
-            for time in times_found
-        ]
+        if any(clean.upper().startswith(word.upper()) for word in stop_keywords):
+            if buffer:
+                merged_lines.append(buffer.strip())
+                buffer = ""
+            merging_allowed = False
 
-        start_time_val = normalized_times[0] if len(normalized_times) >= 1 else "NULL"
-        end_time_val   = normalized_times[1] if len(normalized_times) >= 2 else "NULL"
-
-        # Detect event type
-        detected_event = "Other"
-        lowered_sentence = sentence_text.lower()
-        for event_name, keywords_list in map_keyword.items():
-            if any(keyword in lowered_sentence for keyword in keywords_list):
-                detected_event = event_name
-                break
-
-        # Extract named entities (NER)
-        entities = [(ent.text, ent.label_) for ent in doc.ents]
-
-        if start_time_val != "NULL" or detected_event != "Other":
-            identified_events.append({
-                "id": str(uuid.uuid4()),
-                "documentType": "SOF Event",
-                "event": detected_event,
-                "startTime": start_time_val,
-                "endTime": end_time_val,
-                "detail": sentence_text,
-                "ml_entities": entities
-            })
-    return identified_events
-
-
-# --- Unified Schema Entry ---
-def create_unified_entry(
-    doc_type: str,
-    event: str = "",
-    startTime: str = "",
-    endTime: str = "",
-    detail: str = ""
-) -> dict:
-    return {
-        "id": str(uuid.uuid4()),
-        "documentType": doc_type,
-        "event": event,
-        "startTime": startTime,
-        "endTime": endTime,
-        "detail": detail
-    }
-
-
-# --- ML Algorithm Integration ---
-def process_documents_with_ml(  
-    sof_file_path: Path,
-    cp_file_path: Optional[Path] = None,
-    additional_file_path: Optional[Path] = None
-) -> List[dict]:
-    print(f"Processing SOF: {sof_file_path}")
-    if cp_file_path:
-        print(f"Processing CP: {cp_file_path}")
-    if additional_file_path:
-        print(f"Processing Additional: {additional_file_path}")
-
-    all_processed_data = []
-
-    # --- SOF Processing ---
-    sof_file_extension = sof_file_path.suffix.lower().lstrip('.')
-    sof_lines = []
-    try:
-        if sof_file_extension == 'pdf':
-            sof_lines = pdf_extract(sof_file_path)
-        elif sof_file_extension == 'docx':
-            sof_lines = extract_docx_lines(sof_file_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error extracting SOF data from {sof_file_path.name}: {e}")
-
-    if sof_lines:
-        extracted_sof_events = ml_parse_events(sof_lines)
-        all_processed_data.extend(extracted_sof_events)
-    else:
-        all_processed_data.append(create_unified_entry(
-            doc_type="SOF Report",
-            detail="No specific events found or extracted from SOF document."
-        ))
-
-    # --- CP Processing (Optional) ---
-    if cp_file_path:
-        cp_file_extension = cp_file_path.suffix.lower().lstrip('.')
-        cp_lines = []
-        try:
-            if cp_file_extension == 'pdf':
-                cp_lines = pdf_extract(cp_file_path)
-            elif cp_file_extension == 'docx':
-                cp_lines = extract_docx_lines(cp_file_path)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error extracting CP data: {e}")
-
-        if cp_lines:
-            all_processed_data.append(create_unified_entry(
-                doc_type="CP Detail",
-                detail=cp_lines[0][:200] + "..." if cp_lines else "Content present, but no specific details parsed yet."
-            ))
+        if merging_allowed:
+            if serial_pattern.match(clean):
+                if buffer:
+                    merged_lines.append(buffer.strip())
+                    buffer = ""
+                buffer = clean
+            else:
+                if buffer:
+                    buffer += " " + clean
+                else:
+                    merged_lines.append(clean)
         else:
-            all_processed_data.append(create_unified_entry(
-                doc_type="CP Detail",
-                detail="No extractable content found for CP document."
-            ))
-            
-    # Debug save
-    if all_processed_data:
+            if buffer:
+                merged_lines.append(buffer.strip())
+                buffer = ""
+            merged_lines.append(clean)
+
+    if buffer:
+        merged_lines.append(buffer.strip())
+
+    return merged_lines
+
+
+# ---------------- Parsing (file2.py logic) ---------------- #
+time_pattern = re.compile(r"\b\d{4}\b")
+range_pattern = re.compile(r"\b(\d{4})\s*[-|]\s*(\d{4})\b")
+date_pattern = re.compile(r"\b\d{2}[./-]\d{2}[./-]\d{2,4}\b", re.IGNORECASE)
+day_pattern = re.compile(r"\b(MON|TUE|WED|THU|FRI|SAT|SUN)\b", re.IGNORECASE)
+
+
+def normalize_time(t: str) -> Optional[str]:
+    if not t:
+        return None
+    t = t.strip()
+    if len(t) == 4 and t.isdigit():
+        return f"{t[:2]}:{t[2:]}"
+    return None
+
+
+def normalize_date(d: str) -> Optional[str]:
+    if not d:
+        return None
+    d = d.replace(".", "-").replace("/", "-")
+    parts = d.split("-")
+    if len(parts[2]) == 2:
+        year = "20" + parts[2]
+    else:
+        year = parts[2]
+    return f"{parts[0]}-{parts[1]}-{year}"
+
+
+def parse_events(lines: List[str]) -> List[dict]:
+    events = []
+    last_date, last_day, last_end_time = None, None, None
+
+    for raw in lines:
+        date_match = date_pattern.search(raw)
+        day_match = day_pattern.search(raw)
+        if date_match:
+            last_date = normalize_date(date_match.group(0))
+        if day_match:
+            last_day = day_match.group(0).capitalize()
+
+        range_match = range_pattern.search(raw)
+        times = time_pattern.findall(raw)
+
+        start_time, end_time = None, None
+        if range_match:
+            start_time = normalize_time(range_match.group(1))
+            end_time = normalize_time(range_match.group(2))
+        elif len(times) == 1:
+            end_time = normalize_time(times[0])
+            start_time = last_end_time if last_end_time else "00:00"
+        elif len(times) >= 2:
+            start_time = normalize_time(times[0])
+            end_time = normalize_time(times[1])
+
+        if start_time or end_time:
+            event_name = raw
+            for t in times:
+                event_name = event_name.replace(t, "")
+            if date_match:
+                event_name = event_name.replace(date_match.group(0), "")
+            if day_match:
+                event_name = event_name.replace(day_match.group(0), "")
+            event_name = re.sub(r"\bhrs?\b", "", event_name, flags=re.IGNORECASE)
+            event_name = re.sub(r"[-|]", " ", event_name)
+            event_name = re.sub(r"\s+", " ", event_name).strip()
+
+            # eventName NULL if it has no alphabets
+            if not re.search(r"[A-Za-z]", event_name):
+                event_name = "NULL"
+
+            events.append({
+                "s_no": len(events) + 1,
+                "eventName": event_name,
+                "date": f"{last_date or ''} {last_day or ''}".strip() or "NULL",
+                "startTime": start_time or "NULL",
+                "endTime": end_time or "NULL",
+            })
+            last_end_time = end_time
+
+    return events
+
+
+# ---------------- Document Processor ---------------- #
+def process_documents_with_ml(sof_file_path: Path) -> List[dict]:
+    ext = sof_file_path.suffix.lower().lstrip(".")
+    if ext == "pdf":
+        sof_lines, _ = pdf_extract(sof_file_path)
+    elif ext == "docx":
+        sof_lines = extract_docx_lines(sof_file_path)
+    elif ext == "txt":
+        sof_lines = extract_txt_lines(sof_file_path)
+    else:
+        raise HTTPException(400, "Unsupported file type")
+
+    cleaned = clean_and_merge(sof_lines)
+    events = parse_events(cleaned)
+
+    if events:
         try:
-            debug_df = pd.DataFrame(all_processed_data)
-            debug_df.to_csv(Path(settings.UPLOAD_DIR) / 'combined_output.csv', index=False)
-            with open(Path(settings.UPLOAD_DIR) / 'combined_output.json', "w") as jf:
-                json.dump(all_processed_data, jf, indent=4)
-            print(f"Combined processed data saved to {settings.UPLOAD_DIR}/combined_output.csv and .json")
+            pd.DataFrame(events).to_csv(Path(settings.UPLOAD_DIR) / "combined_output.csv", index=False)
+            with open(Path(settings.UPLOAD_DIR) / "combined_output.json", "w") as jf:
+                json.dump(events, jf, indent=4)
         except Exception as e:
             print(f"Error saving debug output: {e}")
 
-    print("ML Processing Complete")
-    return all_processed_data
+    return events
 
 
-# --- API Endpoints ---
+# ---------------- API ---------------- #
 @app.post("/process-documents/", status_code=status.HTTP_202_ACCEPTED)
-async def process_documents(
-    sof_file: UploadFile = File(...),
-    cp_file: Optional[UploadFile] = File(None),
-    additional_file: Optional[UploadFile] = File(None),
-):
-    allowed_sof_cp_ext = ['pdf', 'docx']
-    allowed_additional_ext = ['pdf', 'docx', 'txt']
-
-    def validate_file(file: UploadFile, allowed_ext: List[str], file_type_name: str):
-        file_extension = Path(file.filename).suffix.lower().lstrip('.')
-        if file_extension not in allowed_ext:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid file type for {file_type_name}. Allowed: {', '.join(allowed_ext)}"
-            )
-        return file_extension
-
-    validate_file(sof_file, allowed_sof_cp_ext, "Statement of Facts")
-    if cp_file:
-        validate_file(cp_file, allowed_sof_cp_ext, "Charter Party document")
-    if additional_file:
-        validate_file(additional_file, allowed_additional_ext, "Additional document")
+async def process_documents(sof_file: UploadFile = File(...)):
+    allowed_ext = ["pdf", "docx", "txt"]
+    file_extension = Path(sof_file.filename).suffix.lower().lstrip(".")
+    if file_extension not in allowed_ext:
+        raise HTTPException(400, f"Invalid file type. Allowed: {', '.join(allowed_ext)}")
 
     sof_file_name = f"{uuid.uuid4()}_{sof_file.filename}"
     sof_file_path = Path(settings.UPLOAD_DIR) / sof_file_name
+    with sof_file_path.open("wb") as buffer:
+        shutil.copyfileobj(sof_file.file, buffer)
 
-    cp_file_path: Optional[Path] = None
-    if cp_file:
-        cp_file_name = f"{uuid.uuid4()}_{cp_file.filename}"
-        cp_file_path = Path(settings.UPLOAD_DIR) / cp_file_name
+    processed_data = process_documents_with_ml(sof_file_path)
 
-    additional_file_path: Optional[Path] = None
-    if additional_file:
-        additional_file_name = f"{uuid.uuid4()}_{additional_file.filename}"
-        additional_file_path = Path(settings.UPLOAD_DIR) / additional_file_name
-
-    temp_file_paths_to_cleanup: List[Path] = []
-
-    try:
-        with sof_file_path.open("wb") as buffer:
-            shutil.copyfileobj(sof_file.file, buffer)
-        temp_file_paths_to_cleanup.append(sof_file_path)
-
-        if cp_file and cp_file_path:
-            with cp_file_path.open("wb") as buffer:
-                shutil.copyfileobj(cp_file.file, buffer)
-            temp_file_paths_to_cleanup.append(cp_file_path)
-
-        if additional_file and additional_file_path:
-            with additional_file_path.open("wb") as buffer:
-                shutil.copyfileobj(additional_file.file, buffer)
-            temp_file_paths_to_cleanup.append(additional_file_path)
-
-    except Exception as e:
-        for path in temp_file_paths_to_cleanup:
-            if path.exists():
-                os.remove(path)
-        raise HTTPException(status_code=500, detail=f"Failed to save files: {e}")
-
-    try:
-        processed_data = process_documents_with_ml(sof_file_path, cp_file_path, additional_file_path)
-
-        unified_keys = ["id", "documentType", "event", "startTime", "endTime", "detail", "ml_entities"]
-        final_processed_data = []
-        for item in processed_data:
-            new_item = {key: item.get(key, "") for key in unified_keys}
-            final_processed_data.append(new_item)
-
-        return JSONResponse(
-            status_code=200,
-            content={"message": "Files processed successfully!", "processed_data": final_processed_data}
-        )
-    finally:
-        for path in temp_file_paths_to_cleanup:
-            if path.exists():
-                os.remove(path)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "Files processed successfully!",
+            "processed_data": processed_data,
+            "csv_path": str(Path(settings.UPLOAD_DIR) / "combined_output.csv"),
+            "json_path": str(Path(settings.UPLOAD_DIR) / "combined_output.json"),
+        },
+    )
 
 
-# Root endpoint
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Document Processor Backend with ML + NLP!"}
